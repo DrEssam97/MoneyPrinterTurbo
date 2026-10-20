@@ -29,6 +29,9 @@ from moviepy import (
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps
+import khatt
+from khatt.fonts import font_path as khatt_font_path
+from khatt.video import TextClip as KhattTextClip
 
 from app.config import config
 from app.models import const
@@ -1285,6 +1288,46 @@ def combine_videos(
     return combined_video_path
 
 
+# 阿拉伯字母文字（阿拉伯语、波斯语、乌尔都语等）需要 HarfBuzz 字形塑形和
+# 从右到左排版。Pillow 只有在带 Raqm 时才会塑形，而 Windows 版 Pillow 通常
+# 不带 Raqm，字母会断开并倒序显示。因此只有这类字幕交给 khatt 渲染；
+# 其他语言仍走原来的 MoviePy TextClip，输出与修改前完全一致。
+_ARABIC_SCRIPT_RANGES = (
+    (0x0600, 0x06FF),  # Arabic
+    (0x0750, 0x077F),  # Arabic Supplement
+    (0x0870, 0x089F),  # Arabic Extended-B
+    (0x08A0, 0x08FF),  # Arabic Extended-A
+    (0xFB50, 0xFDFF),  # Arabic Presentation Forms-A
+    (0xFE70, 0xFEFC),  # Arabic Presentation Forms-B（不含 U+FEFF BOM）
+)
+
+# 所选字体缺少阿拉伯字形时，回退到 khatt 自带的 Amiri（SIL OFL 授权）。
+ARABIC_FALLBACK_FONT = str(khatt_font_path("amiri"))
+
+
+def is_arabic_script(text) -> bool:
+    """判断文本是否包含阿拉伯字母文字（阿拉伯语、波斯语、乌尔都语等）。"""
+    return any(
+        start <= ord(char) <= end
+        for char in str(text or "")
+        for start, end in _ARABIC_SCRIPT_RANGES
+    )
+
+
+def arabic_subtitle_font(font_path: str, text: str) -> str:
+    """返回能绘制文本中阿拉伯字母的字体：所选字体缺字时使用 Amiri。"""
+    arabic_chars = "".join(char for char in str(text or "") if is_arabic_script(char))
+    if not arabic_chars or not khatt.missing_characters(arabic_chars, font_path):
+        return font_path
+    return ARABIC_FALLBACK_FONT
+
+
+def shaped_text_width(text: str, font_path: str, font_size: int) -> int:
+    """按 HarfBuzz 塑形后的实际墨迹测量文字宽度（像素）。"""
+    left, _, right, _ = khatt.text_bbox(text, font=font_path, size_px=font_size)
+    return right - left
+
+
 def wrap_text(text, max_width, font="Arial", fontsize=60):
     # 字幕换行必须在真正创建 TextClip 前完成，否则 MoviePy 只会按原始文本
     # 计算渲染区域。这里用 PIL 按当前字体和字号测量宽度，确保每一行都尽量
@@ -1301,8 +1344,12 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
             height for _, height in wrapped_lines
         )
 
+    font_file = font
     font = ImageFont.truetype(font, fontsize)
     max_width = int(max_width)
+    # 阿拉伯字母文字必须按塑形后的字形测量宽度：Pillow 不带 Raqm 时按断开、
+    # 倒序的孤立字母测量，换行位置会偏差。
+    measure_shaped = is_arabic_script(text)
 
     # getbbox() 返回的是“当前字形的可见墨迹高度”，并不是字体行高。例如只含
     # A、m、n 等无下伸部字符的英文会缺少 descent，多行时这个误差会逐行累积，
@@ -1323,6 +1370,8 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
         inner_text = inner_text.strip()
         if not inner_text:
             return 0, line_height
+        if measure_shaped:
+            return shaped_text_width(inner_text, font_file, fontsize), line_height
         left, top, right, bottom = font.getbbox(inner_text)
         # bbox 仍适合测量换行所需的实际宽度；高度必须始终使用稳定字体行高。
         return right - left, line_height
@@ -1546,11 +1595,14 @@ def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
 
 def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     """检查字体能否绘制文本中的字母和数字，忽略空白及标点符号。"""
+    # 阿拉伯字母文字由 khatt 渲染，所选字体缺字时会自动改用 Amiri，
+    # 因此这些字符不再算作所选字体的缺字。
     sample = "".join(
         dict.fromkeys(
             char
             for char in str(text or "")
             if unicodedata.category(char)[0] in {"L", "N"}
+            and not is_arabic_script(char)
         )
     )[:64]
     if not sample:
@@ -1602,6 +1654,20 @@ def generate_video(
 
         logger.info(f"  ⑤ font: {font_path}")
 
+    arabic_font_fallback_warned = False
+
+    def resolve_arabic_subtitle_font(text):
+        # 每个任务只提示一次，避免长字幕逐条刷屏。
+        nonlocal arabic_font_fallback_warned
+        resolved = arabic_subtitle_font(font_path, text)
+        if resolved != font_path and not arabic_font_fallback_warned:
+            arabic_font_fallback_warned = True
+            logger.warning(
+                "subtitle font has no Arabic-script glyphs, "
+                f"using Amiri for Arabic subtitles: {font_path}"
+            )
+        return resolved
+
     def resolve_subtitle_background_color():
         # 兼容历史参数：API 里 `text_background_color` 既可能是布尔值，
         # 也可能是实际颜色字符串。统一在这里归一化，避免把 True/False
@@ -1614,6 +1680,11 @@ def generate_video(
         params.font_size = int(params.font_size)
         params.stroke_width = int(params.stroke_width)
         phrase = subtitle_item[1]
+        # 阿拉伯字母文字字幕交给 khatt 塑形渲染（参数与 TextClip 相同），
+        # 其他语言保持原有 TextClip 渲染路径。
+        arabic = is_arabic_script(phrase)
+        clip_font = resolve_arabic_subtitle_font(phrase) if arabic else font_path
+        text_clip_class = KhattTextClip if arabic else TextClip
         max_width = video_width * 0.9
         bg_color = resolve_subtitle_background_color()
         rounded_bg_enabled = bool(
@@ -1632,7 +1703,7 @@ def generate_video(
         wrapped_txt, txt_height = wrap_text(
             phrase,
             max_width=text_max_width,
-            font=font_path,
+            font=clip_font,
             fontsize=params.font_size,
         )
         interline = int(params.font_size * 0.25)
@@ -1661,11 +1732,17 @@ def generate_video(
             # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
             # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
             try:
-                font = ImageFont.truetype(font_path, params.font_size)
-                text_w = max(
-                    int(font.getbbox(line)[2] - font.getbbox(line)[0])
-                    for line in wrapped_txt.split("\n")
-                )
+                if arabic:
+                    text_w = max(
+                        shaped_text_width(line, clip_font, params.font_size)
+                        for line in wrapped_txt.split("\n")
+                    )
+                else:
+                    font = ImageFont.truetype(font_path, params.font_size)
+                    text_w = max(
+                        int(font.getbbox(line)[2] - font.getbbox(line)[0])
+                        for line in wrapped_txt.split("\n")
+                    )
             except Exception as exc:
                 logger.warning(
                     f"failed to measure subtitle text width, fallback to max width: {str(exc)}"
@@ -1674,9 +1751,9 @@ def generate_video(
 
             box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
             radius = max(8, int(params.font_size * 0.4))
-            text_clip = TextClip(
+            text_clip = text_clip_class(
                 text=wrapped_txt,
-                font=font_path,
+                font=clip_font,
                 font_size=params.font_size,
                 color=params.text_fore_color,
                 bg_color=None,
@@ -1705,9 +1782,9 @@ def generate_video(
                 int(max_width),
                 clip_h,
             )
-            text_clip = TextClip(
+            text_clip = text_clip_class(
                 text=wrapped_txt,
-                font=font_path,
+                font=clip_font,
                 font_size=params.font_size,
                 color=params.text_fore_color,
                 bg_color=None,
@@ -1736,9 +1813,9 @@ def generate_video(
                 int(max_width),
                 clip_h,
             )
-            _clip = TextClip(
+            _clip = text_clip_class(
                 text=wrapped_txt,
-                font=font_path,
+                font=clip_font,
                 font_size=params.font_size,
                 color=params.text_fore_color,
                 bg_color=None,
@@ -1794,6 +1871,12 @@ def generate_video(
         )
 
         def make_textclip(text):
+            if is_arabic_script(text):
+                return KhattTextClip(
+                    text=text,
+                    font=resolve_arabic_subtitle_font(text),
+                    font_size=params.font_size,
+                )
             return TextClip(
                 text=text,
                 font=font_path,
