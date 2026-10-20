@@ -1314,6 +1314,29 @@ def is_arabic_script(text) -> bool:
     )
 
 
+def is_rtl_paragraph(text) -> bool:
+    """按第一个强方向字符判断段落方向（Unicode 双向算法 P2/P3 规则）。"""
+    for char in str(text or ""):
+        direction = unicodedata.bidirectional(char)
+        if direction in ("R", "AL"):
+            return True
+        if direction == "L":
+            return False
+    return False
+
+
+def keep_rtl_lines(wrapped_text: str, phrase: str) -> str:
+    """换行后让每一行都保持整段的从右到左方向。
+
+    每一行在渲染时都会被当作独立段落，按行首第一个强方向字符判断方向。
+    阿拉伯语句子折行后，若某行以英文单词或数字开头，会被误判为从左到右，
+    词序随之颠倒。在每行行首加不可见的 RLM（U+200F）即可固定方向。
+    """
+    if not is_rtl_paragraph(phrase):
+        return wrapped_text
+    return "\n".join(f"\u200f{line}" for line in wrapped_text.split("\n"))
+
+
 def arabic_subtitle_font(font_path: str, text: str) -> str:
     """返回能绘制文本中阿拉伯字母的字体：所选字体缺字时使用 Amiri。"""
     arabic_chars = "".join(char for char in str(text or "") if is_arabic_script(char))
@@ -1328,7 +1351,7 @@ def shaped_text_width(text: str, font_path: str, font_size: int) -> int:
     return right - left
 
 
-def wrap_text(text, max_width, font="Arial", fontsize=60):
+def wrap_text(text, max_width, font="Arial", fontsize=60, *, rtl=None):
     # 字幕换行必须在真正创建 TextClip 前完成，否则 MoviePy 只会按原始文本
     # 计算渲染区域。这里用 PIL 按当前字体和字号测量宽度，确保每一行都尽量
     # 控制在视频可用宽度内，避免大字号或中文长句直接溢出画面。
@@ -1336,8 +1359,11 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
         # Hard breaks in SRT text are separate layout lines. Measuring a token
         # across a newline makes Pillow count both lines as one wide string,
         # then character wrapping can split an otherwise fitting word.
+        # 手动换行的各行仍属于同一段落：按整段方向测量每一行。
+        if rtl is None:
+            rtl = is_arabic_script(text) and is_rtl_paragraph(text)
         wrapped_lines = [
-            wrap_text(line, max_width, font=font, fontsize=fontsize)
+            wrap_text(line, max_width, font=font, fontsize=fontsize, rtl=rtl)
             for line in text.split("\n")
         ]
         return "\n".join(line for line, _ in wrapped_lines), sum(
@@ -1348,8 +1374,12 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
     font = ImageFont.truetype(font, fontsize)
     max_width = int(max_width)
     # 阿拉伯字母文字必须按塑形后的字形测量宽度：Pillow 不带 Raqm 时按断开、
-    # 倒序的孤立字母测量，换行位置会偏差。
+    # 倒序的孤立字母测量，换行位置会偏差。测量时也要用渲染时的段落方向
+    # （见 keep_rtl_lines），否则混排行的词序不同，宽度也会不同。
     measure_shaped = is_arabic_script(text)
+    if rtl is None:
+        rtl = measure_shaped and is_rtl_paragraph(text)
+    direction_mark = "\u200f" if rtl else ""
 
     # getbbox() 返回的是“当前字形的可见墨迹高度”，并不是字体行高。例如只含
     # A、m、n 等无下伸部字符的英文会缺少 descent，多行时这个误差会逐行累积，
@@ -1371,7 +1401,8 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
         if not inner_text:
             return 0, line_height
         if measure_shaped:
-            return shaped_text_width(inner_text, font_file, fontsize), line_height
+            width = shaped_text_width(direction_mark + inner_text, font_file, fontsize)
+            return width, line_height
         left, top, right, bottom = font.getbbox(inner_text)
         # bbox 仍适合测量换行所需的实际宽度；高度必须始终使用稳定字体行高。
         return right - left, line_height
@@ -1706,6 +1737,8 @@ def generate_video(
             font=clip_font,
             fontsize=params.font_size,
         )
+        if arabic:
+            wrapped_txt = keep_rtl_lines(wrapped_txt, phrase)
         interline = int(params.font_size * 0.25)
         line_count = wrapped_txt.count("\n") + 1
         vertical_padding = int(params.font_size * 0.35)

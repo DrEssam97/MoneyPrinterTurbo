@@ -61,6 +61,34 @@ def test_arabic_lines_wrap_by_shaped_width():
     assert height == len(lines) * sum(ImageFont.truetype(font, 48).getmetrics())
 
 
+def test_wrapped_lines_keep_the_paragraphs_right_to_left_direction():
+    # 折行后以英文开头的行若被当作从左到右段落，词序会颠倒。
+    wrapped = "مرحبا بالعالم\nKhatt 2026 جديد"
+    kept = vd.keep_rtl_lines(wrapped, "مرحبا بالعالم Khatt 2026 جديد")
+    assert kept == "\u200fمرحبا بالعالم\n\u200fKhatt 2026 جديد"
+    assert all(vd.is_rtl_paragraph(line) for line in kept.split("\n"))
+    # 以英文开头的段落保持从左到右，不做改动。
+    assert vd.keep_rtl_lines("Khatt 2026\nجديد", "Khatt 2026 جديد") == "Khatt 2026\nجديد"
+
+
+def test_rtl_mark_draws_nothing_and_takes_no_width():
+    font = vd.ARABIC_FALLBACK_FONT
+    line = "مرحبا بالعالم"
+    assert vd.shaped_text_width("\u200f" + line, font, 48) == vd.shaped_text_width(line, font, 48)
+    assert khatt.missing_characters("\u200f", font) == []
+
+
+def test_mixed_lines_are_measured_in_the_direction_they_render():
+    # 以英文开头的阿拉伯段落折行：测量宽度必须和渲染（从右到左）一致。
+    text = "مرحبا بالعالم Khatt 2026 جديد " * 3
+    font = vd.ARABIC_FALLBACK_FONT
+    max_width = 300
+    wrapped, _ = vd.wrap_text(text.strip(), max_width, font=font, fontsize=48)
+    rendered = vd.keep_rtl_lines(wrapped, text)
+    assert len(rendered.split("\n")) > 1
+    assert all(vd.shaped_text_width(line, font, 48) <= max_width for line in rendered.split("\n"))
+
+
 def test_bundled_font_no_longer_reports_arabic_as_unsupported():
     # Amiri 会自动补上阿拉伯字形，因此 WebUI 不再误报字体不支持。
     assert vd.subtitle_font_supports_text(DEFAULT_FONT, "مرحبا بالعالم")
@@ -154,6 +182,10 @@ def test_only_arabic_subtitles_go_through_khatt(overrides):
     assert moviepy_texts and not any(vd.is_arabic_script(text) for text in moviepy_texts)
     assert all(
         call.kwargs["font"] == vd.ARABIC_FALLBACK_FONT for call in khatt_renderer.call_args_list
+    )
+    # 每一行都固定为从右到左（行首 RLM）。
+    assert all(
+        line.startswith("\u200f") for text in khatt_texts for line in text.split("\n")
     )
     # 阿拉伯字幕所在的那一秒确实画出了字幕（白色文字）。
     assert (frame >= 250).all(axis=2).any()
