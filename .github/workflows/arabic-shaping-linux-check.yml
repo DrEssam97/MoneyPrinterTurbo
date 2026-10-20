@@ -1,0 +1,48 @@
+# Fork-only check (never proposed upstream): run the full test suite on Linux,
+# with and without Pillow's Raqm, for the Arabic subtitle shaping branch.
+name: Arabic shaping Linux check
+
+on:
+  push:
+    branches: [ci/arabic-subtitle-linux-check]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: py${{ matrix.python }} / raqm ${{ matrix.raqm }}
+    runs-on: ubuntu-latest
+    container: python:${{ matrix.python }}-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+        raqm: ["off", "on"]
+    env:
+      PYTHONUTF8: "1"
+      UV_LINK_MODE: copy
+    steps:
+      - name: System packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ffmpeg
+          if [ "${{ matrix.raqm }}" = "on" ]; then
+            apt-get install -y --no-install-recommends libraqm0 libfribidi0
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Install uv and sync
+        run: |
+          pip install --quiet uv
+          uv sync --frozen --python python${{ matrix.python }}
+
+      - name: Environment
+        run: |
+          uv run --no-sync python -c "import PIL, khatt; from PIL import features; print('Pillow', PIL.__version__, '| raqm', features.check('raqm'), '| khatt', khatt.__version__)"
+          uv run --no-sync python -c "from PIL import features; import sys; want = '${{ matrix.raqm }}' == 'on'; sys.exit(0 if features.check('raqm') == want else 1)"
+
+      - name: Arabic subtitle tests
+        run: uv run --no-sync python -X utf8 -m pytest -v -p no:cacheprovider test/services/test_subtitle_arabic_shaping.py
+
+      - name: Full test suite
+        run: uv run --no-sync python -X utf8 -m pytest -q -p no:cacheprovider -rf test
