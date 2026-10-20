@@ -1,0 +1,22 @@
+# Fork-only check (never proposed upstream): does this test also fail on
+# pristine upstream main on macOS? It failed on the Arabic shaping branch.
+name: macOS baseline check
+
+on:
+  push:
+    branches: [ci/macos-baseline]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macos / py3.11 / upstream main
+    runs-on: macos-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --frozen --python 3.11
+      - run: uv run --no-sync python -X utf8 -m pytest -q -p no:cacheprovider -rf "test/services/test_video_project.py::test_dash_external_segments_cannot_escape_source_snapshot" test/services/test_video_project.py
