@@ -1,8 +1,9 @@
-# Fork-only check (never proposed upstream): run the full test suite for the
-# Arabic subtitle shaping branch on Linux and macOS. (Windows, where Pillow has
-# no Raqm, is covered locally. Pillow 11.3.0's Linux wheels bundle Raqm, so a
-# Raqm-less Linux run isn't possible with MoneyPrinterTurbo's pins.)
-name: Arabic shaping Linux/macOS check
+# Fork-only check (never proposed upstream): run the Arabic subtitle shaping
+# tests and the full test suite on Linux, macOS and Windows. Windows is where
+# Pillow usually has no Raqm, the case the shaping fix is for (the Environment
+# step prints it). Pillow 11.3.0's Linux wheels bundle Raqm, so a Raqm-less
+# Linux run isn't possible with MoneyPrinterTurbo's pins.
+name: Arabic shaping Linux/macOS/Windows check
 
 on:
   push:
@@ -61,4 +62,46 @@ jobs:
       - name: Arabic subtitle tests
         run: uv run --no-sync python -X utf8 -m pytest -v -p no:cacheprovider test/services/test_subtitle_arabic_shaping.py
       - name: Full test suite
+        run: uv run --no-sync python -X utf8 -m pytest -q -p no:cacheprovider -rf test
+
+  windows:
+    name: windows / py${{ matrix.python }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    env:
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Sync
+        run: uv sync --frozen --python ${{ matrix.python }}
+      - name: Environment
+        run: uv run --no-sync python -c "import PIL, khatt; from PIL import features; print('Pillow', PIL.__version__, '| raqm', features.check('raqm'), '| khatt', khatt.__version__)"
+      - name: Arabic subtitle tests
+        run: uv run --no-sync python -X utf8 -m pytest -v -p no:cacheprovider test/services/test_subtitle_arabic_shaping.py
+      - name: Upstream Windows smoke tests
+        run: >-
+          uv run --no-sync python -X utf8 -m pytest -q -p no:cacheprovider
+          test/services/test_config.py
+          test/services/test_state.py
+          test/services/test_task.py
+          test/services/test_task_manager.py
+          test/services/test_upload_post.py
+          test/services/test_controller_video.py
+          test/services/test_webui_task.py
+          test/services/test_webui_headless_task_actions.py
+          test/services/test_cache_manager.py
+          test/services/test_material_cache.py
+      # Upstream runs only the smoke tests above on Windows; the full suite
+      # is informational here (its failures are reported, not gating).
+      - name: Full test suite (informational)
+        continue-on-error: true
         run: uv run --no-sync python -X utf8 -m pytest -q -p no:cacheprovider -rf test
